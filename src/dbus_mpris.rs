@@ -21,16 +21,16 @@ use librespot_core::{
     spotify_id::SpotifyAudioType,
 };
 use librespot_playback::player::PlayerEvent;
-use log::{error, info};
+use log::{error, info, warn};
 use rspotify::{
     model::{
-        offset::Offset, AlbumId, ArtistId, EpisodeId, IdError, PlayableItem, PlaylistId,
+        offset::Offset, parse_uri, AlbumId, ArtistId, EpisodeId, IdError, PlayableItem, PlaylistId,
         RepeatState, ShowId, TrackId, Type,
     },
     prelude::*,
     AuthCodeSpotify, Token as RspotifyToken,
 };
-use std::{collections::HashMap, convert::TryInto, env, pin::Pin, sync::Arc};
+use std::{collections::HashMap, env, pin::Pin, sync::Arc};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 pub struct DbusServer {
@@ -234,12 +234,14 @@ async fn create_dbus_server(
         b.method("VolumeUp", (), (), move |_, _, (): ()| {
             local_spirc.volume_up();
             Ok(())
-        });
+        })
+        .deprecated();
         let local_spirc = spirc.clone();
         b.method("VolumeDown", (), (), move |_, _, (): ()| {
             local_spirc.volume_down();
             Ok(())
-        });
+        })
+        .deprecated();
         let local_spirc = spirc.clone();
         b.method("Next", (), (), move |_, _, (): ()| {
             local_spirc.next();
@@ -279,23 +281,19 @@ async fn create_dbus_server(
                 if playback.device.name == mv_device_name {
                     let new_pos = playback
                         .progress
-                        .and_then(|d| d.as_millis().try_into().ok())
-                        .and_then(|d: i64| d.checked_add(pos / 1000));
+                        .and_then(|d| d.checked_add(&Duration::milliseconds(pos / 1000)));
 
                     if let Some(new_pos) = new_pos {
-                        let duration: u32 = match playback.item {
-                            Some(PlayableItem::Track(t)) => t.duration.as_millis(),
-                            Some(PlayableItem::Episode(e)) => e.duration.as_millis(),
+                        let duration: Duration = match playback.item {
+                            Some(PlayableItem::Track(t)) => t.duration,
+                            Some(PlayableItem::Episode(e)) => e.duration,
                             None => return Ok(()),
-                        }
-                        .try_into()
-                        .unwrap_or(u32::MAX);
+                        };
 
                         // MPRIS spec: negative values should be treated as 0
-                        let new_pos = new_pos.max(0);
-                        if new_pos <= duration as i64 {
-                            let _ =
-                                sp_client.seek_track(new_pos as u32, playback.device.id.as_deref());
+                        let new_pos = new_pos.max(Duration::zero());
+                        if new_pos <= duration {
+                            let _ = sp_client.seek_track(new_pos, playback.device.id.as_deref());
                         } else {
                             // MPRIS spec: values beyond track bounds should act like Next
                             let _ = sp_client.next_track(playback.device.id.as_deref());
@@ -320,10 +318,9 @@ async fn create_dbus_server(
                             .map(|id| uri_to_object_path(id.uri()) == track_id)
                             .unwrap_or(false);
                         let duration = match item {
-                            PlayableItem::Track(t) => t.duration.as_micros(),
-                            PlayableItem::Episode(e) => e.duration.as_micros(),
+                            PlayableItem::Track(t) => t.duration.num_microseconds(),
+                            PlayableItem::Episode(e) => e.duration.num_microseconds(),
                         }
-                        .try_into()
                         .unwrap_or(i64::MAX);
                         (track_matches, duration)
                     } else {
@@ -336,8 +333,10 @@ async fn create_dbus_server(
                         && (0..=duration).contains(&pos)
                     {
                         // pos is in microseconds, seek_track takes milliseconds
-                        let _ = sp_client
-                            .seek_track((pos / 1000) as u32, playback.device.id.as_deref());
+                        let _ = sp_client.seek_track(
+                            Duration::milliseconds(pos / 1000),
+                            playback.device.id.as_deref(),
+                        );
                     }
                 }
                 Ok(())
@@ -347,97 +346,45 @@ async fn create_dbus_server(
         let mv_device_name = device_name.clone();
         let sp_client = Arc::clone(&spotify_api_client);
         b.method("OpenUri", ("uri",), (), move |_, _, (uri,): (String,)| {
-            struct AnyContextId(Box<dyn PlayContextId>);
-
-            impl Id for AnyContextId {
-                fn id(&self) -> &str {
-                    self.0.id()
-                }
-
-                fn _type(&self) -> Type {
-                    self.0._type()
-                }
-
-                fn _type_static() -> Type
-                where
-                    Self: Sized,
-                {
-                    unreachable!("never called");
-                }
-
-                unsafe fn from_id_unchecked(_id: &str) -> Self
-                where
-                    Self: Sized,
-                {
-                    unreachable!("never called");
-                }
-            }
-            impl PlayContextId for AnyContextId {}
-
-            enum Uri {
-                Playable(Box<dyn PlayableId>),
-                Context(AnyContextId),
+            enum AnyId<'a> {
+                Playable(PlayableId<'a>),
+                Context(PlayContextId<'a>),
             }
 
-            impl Uri {
-                fn from_id(id_type: Type, id: &str) -> Result<Uri, IdError> {
-                    use Uri::*;
-                    let uri = match id_type {
-                        Type::Track => Playable(Box::new(TrackId::from_id(id)?)),
-                        Type::Episode => Playable(Box::new(EpisodeId::from_id(id)?)),
-                        Type::Artist => Context(AnyContextId(Box::new(ArtistId::from_id(id)?))),
-                        Type::Album => Context(AnyContextId(Box::new(AlbumId::from_id(id)?))),
-                        Type::Playlist => Context(AnyContextId(Box::new(PlaylistId::from_id(id)?))),
-                        Type::Show => Context(AnyContextId(Box::new(ShowId::from_id(id)?))),
-                        Type::User | Type::Collection => return Err(IdError::InvalidType),
-                    };
-                    Ok(uri)
-                }
-            }
-
-            let mut chars = uri
-                .strip_prefix("spotify")
-                .ok_or_else(|| MethodErr::invalid_arg(&uri))?
-                .chars();
-
-            let sep = match chars.next() {
-                Some(ch) if ch == '/' || ch == ':' => ch,
-                _ => return Err(MethodErr::invalid_arg(&uri)),
-            };
-            let rest = chars.as_str();
-
-            let (id_type, id) = rest
-                .rsplit_once(sep)
-                .and_then(|(id_type, id)| Some((id_type.parse::<Type>().ok()?, id)))
-                .ok_or_else(|| MethodErr::invalid_arg(&uri))?;
-
-            let uri = Uri::from_id(id_type, id).map_err(|_| MethodErr::invalid_arg(&uri))?;
-
-            let device_id = sp_client.device().ok().and_then(|devices| {
-                devices.into_iter().find_map(|d| {
-                    if d.is_active && d.name == mv_device_name {
-                        Some(d.id)
-                    } else {
-                        None
+            fn uri_to_id(uri: &str) -> Result<AnyId<'_>, IdError> {
+                use AnyId::*;
+                Ok(match parse_uri(uri)? {
+                    (Type::Track, id) => Playable(TrackId::from_id(id)?.into()),
+                    (Type::Episode, id) => Playable(EpisodeId::from_id(id)?.into()),
+                    (Type::Artist, id) => Context(ArtistId::from_id(id)?.into()),
+                    (Type::Album, id) => Context(AlbumId::from_id(id)?.into()),
+                    (Type::Playlist, id) => Context(PlaylistId::from_id(id)?.into()),
+                    (Type::Show, id) => Context(ShowId::from_id(id)?.into()),
+                    (Type::User | Type::Collection | Type::Collectionyourepisodes, _) => {
+                        Err(IdError::InvalidType)?
                     }
                 })
-            });
+            }
+
+            let id = uri_to_id(&uri).map_err(|e| MethodErr::invalid_arg(&e))?;
+
+            let device_id = get_device_id(&sp_client, &mv_device_name, true);
 
             if let Some(device_id) = device_id {
-                match uri {
-                    Uri::Playable(id) => {
+                match id {
+                    AnyId::Playable(id) => {
                         let _ = sp_client.start_uris_playback(
-                            Some(id.as_ref()),
-                            device_id.as_deref(),
-                            Some(Offset::for_position(0)),
+                            Some(id),
+                            Some(&device_id),
+                            Some(Offset::Position(Duration::zero())),
                             None,
                         );
                     }
-                    Uri::Context(id) => {
+                    AnyId::Context(id) => {
                         let _ = sp_client.start_context_playback(
-                            &id,
-                            device_id.as_deref(),
-                            Some(Offset::for_position(0)),
+                            id,
+                            Some(&device_id),
+                            Some(Offset::Position(Duration::zero())),
                             None,
                         );
                     }
@@ -463,7 +410,9 @@ async fn create_dbus_server(
                 Ok("Stopped".to_string())
             });
 
+        let mv_device_name = device_name.clone();
         let sp_client = Arc::clone(&spotify_api_client);
+        let sp_client2 = Arc::clone(&spotify_api_client);
         b.property("Shuffle")
             .emits_changed_false()
             .get(move |_, _| {
@@ -473,6 +422,23 @@ async fn create_dbus_server(
                     .flatten()
                     .map_or(false, |p| p.shuffle_state);
                 Ok(shuffle_status)
+            })
+            .set(move |_, _, value| {
+                let device_id = get_device_id(&sp_client2, &mv_device_name, true);
+                if let Some(device_id) = device_id {
+                    match sp_client2.shuffle(value, Some(&device_id)) {
+                        Ok(_) => Ok(None),
+                        Err(err) => {
+                            let e = format!("SetShuffle failed: {}", err);
+                            error!("{}", e);
+                            Err(MethodErr::failed(&e))
+                        }
+                    }
+                } else {
+                    let msg = format!("Could not find device with name {}", mv_device_name);
+                    warn!("SetShuffle: {}", msg);
+                    Err(MethodErr::failed(&msg))
+                }
             });
 
         b.property("Rate").emits_changed_const().get(|_, _| Ok(1.0));
@@ -522,7 +488,7 @@ async fn create_dbus_server(
                     .current_playback(None, None::<Vec<_>>)
                     .ok()
                     .flatten()
-                    .and_then(|p| Some(p.progress?.as_micros() as i64))
+                    .and_then(|p| p.progress?.num_microseconds())
                     .unwrap_or(0);
 
                 Ok(pos)
@@ -562,11 +528,47 @@ async fn create_dbus_server(
         }
     });
 
+    let spotifyd_ctrls_interface: IfaceToken<()> = cr.register("rs.spotifyd.Controls", |b| {
+        let local_spirc = spirc.clone();
+        b.method("VolumeUp", (), (), move |_, _, (): ()| {
+            local_spirc.volume_up();
+            Ok(())
+        });
+        let local_spirc = spirc.clone();
+        b.method("VolumeDown", (), (), move |_, _, (): ()| {
+            local_spirc.volume_down();
+            Ok(())
+        });
+
+        let mv_device_name = device_name.clone();
+        let sp_client = Arc::clone(&spotify_api_client);
+        b.method("TransferPlayback", (), (), move |_, _, (): ()| {
+            let device_id = get_device_id(&sp_client, &mv_device_name, false);
+            if let Some(device_id) = device_id {
+                info!("Transferring playback to device {}", device_id);
+                match sp_client.transfer_playback(&device_id, Some(true)) {
+                    Ok(_) => Ok(()),
+                    Err(err) => {
+                        let e = format!("TransferPlayback failed: {}", err);
+                        error!("{}", e);
+                        Err(MethodErr::failed(&e))
+                    }
+                }
+            } else {
+                let msg = format!("Could not find device with name {}", mv_device_name);
+                warn!("TransferPlayback: {}", msg);
+                Err(MethodErr::failed(&msg))
+            }
+        });
+    });
+
     cr.insert(
         "/org/mpris/MediaPlayer2",
         &[media_player2_interface, player_interface],
         (),
     );
+
+    cr.insert("/rs/spotifyd/Controls", &[spotifyd_ctrls_interface], ());
 
     conn.start_receive(
         MatchRule::new_method_call(),
@@ -630,15 +632,16 @@ async fn create_dbus_server(
                 if let Some(track_id) = track_id {
                     let item = match track_id.audio_type {
                         SpotifyAudioType::Track => {
-                            let track_id = TrackId::from_id(&track_id.to_base62()).unwrap();
-                            let track =
-                                spotify_api_client.track(&track_id).map(PlayableItem::Track);
+                            let track_id = TrackId::from_id(track_id.to_base62().unwrap()).unwrap();
+                            let track = spotify_api_client
+                                .track(track_id, None)
+                                .map(PlayableItem::Track);
                             Some(track)
                         }
                         SpotifyAudioType::Podcast => {
-                            let id = EpisodeId::from_id(&track_id.to_base62()).unwrap();
+                            let id = EpisodeId::from_id(track_id.to_base62().unwrap()).unwrap();
                             let episode = spotify_api_client
-                                .get_an_episode(&id, None)
+                                .get_an_episode(id, None)
                                 .map(PlayableItem::Episode);
                             Some(episode)
                         }
@@ -698,6 +701,28 @@ async fn create_dbus_server(
     }
 }
 
+fn get_device_id(
+    sp_client: &AuthCodeSpotify,
+    device_name: &str,
+    only_active: bool,
+) -> Option<String> {
+    let device_result = sp_client.device();
+    match device_result {
+        Ok(devices) => devices.into_iter().find_map(|d| {
+            if d.name == device_name && (d.is_active || !only_active) {
+                info!("Found device: {}, active: {}", d.name, d.is_active);
+                d.id
+            } else {
+                None
+            }
+        }),
+        Err(err) => {
+            error!("Get devices error: {}", err);
+            None
+        }
+    }
+}
+
 fn uri_to_object_path(uri: String) -> dbus::Path<'static> {
     let mut path = String::with_capacity(uri.len() + 1);
     for element in uri.split(':') {
@@ -724,7 +749,7 @@ fn insert_metadata(m: &mut HashMap<String, Variant<Box<dyn RefArg>>>, item: Play
     // a common denominator struct for FullEpisode and FullTrack
     struct TrackOrEpisode {
         id: Option<dbus::Path<'static>>,
-        duration: std::time::Duration,
+        duration: chrono::Duration,
         images: Vec<Image>,
         name: String,
         album_name: String,
@@ -768,7 +793,9 @@ fn insert_metadata(m: &mut HashMap<String, Variant<Box<dyn RefArg>>>, item: Play
 
     m.insert(
         "mpris:length".to_string(),
-        Variant(Box::new(item.duration.as_micros() as i64)),
+        Variant(Box::new(
+            item.duration.num_microseconds().unwrap_or_default(),
+        )),
     );
 
     m.insert(
@@ -776,7 +803,7 @@ fn insert_metadata(m: &mut HashMap<String, Variant<Box<dyn RefArg>>>, item: Play
         Variant(Box::new(
             item.images
                 .into_iter()
-                .next()
+                .max_by_key(|i| i.width.unwrap_or(0))
                 .map(|i| i.url)
                 .unwrap_or_default(),
         )),

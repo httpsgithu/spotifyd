@@ -10,16 +10,14 @@ The provided binaries come in two flavours, `slim` and `full`. Each are compiled
 
 There are packages for the following systems:
 
-- [Arch Linux (via the Community repository)](https://archlinux.org/packages/community/x86_64/spotifyd/)
+- [Arch Linux (via the Extra repository)](https://archlinux.org/packages/extra/x86_64/spotifyd/)
 - [MacOS (via homebrew)](./MacOS.md)
-
-It is also available as a [snap package](https://snapcraft.io/spotifyd).
 
 ## Building from source
 
 You can also compile `Spotifyd` yourself, allowing you to make use of feature flags. `Spotifyd` is written in Rust. You can download the toolchain (compiler and package manager) over at [rustup.rs](https://rustup.rs). Follow their instructions to get started.
 
-> __Note:__ Please make sure that you compile the package using the most recent `stable` verison of Rust available throug `rustup`. Some distro versions are quite outdated and might result in compilation errors.
+> __Note:__ Please make sure that you compile the package using the most recent `stable` version of Rust available through `rustup`. Some distro versions are quite outdated and might result in compilation errors.
 
 `Spotifyd` might require additional libraries during build and runtime, depending on your platform and the way to compile it (static or dynamic). The following table shows the libraries needed for each OS respectively.
 
@@ -85,6 +83,6 @@ To enable an additional audio backend, pass `<audio_backend_name>_backend` as a 
 | Feature Flag | Description                                                                         |
 |--------------|-------------------------------------------------------------------------------------|
 | dbus_keyring | Provides password authentication over the system's keyring (supports all platforms) |
-| dbus_mpris   | Provides multimedia key support (Linux only)                                      |
+| dbus_mpris   | Provides multimedia key support (Linux and BSD only)                                |
 
 > __Note:__ Compiling Spotifyd with all features and the pulseaudio backend on Ubuntu would result in the following command: `cargo build --release --no-default-features --features pulseaudio_backend,dbus_keyring,dbus_mpris`

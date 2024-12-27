@@ -33,3 +33,6 @@ tags
 *.rustfmt
 
 .idea
+.vscode
+# Windows logs
+*.log
