@@ -55,18 +55,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        rust: [stable, 1.81]
         os: [macos-latest, ubuntu-latest]
         include:
           - os: macos-latest
-            features: portaudio_backend,rodio_backend,dbus_keyring
+            features: portaudio_backend,rodio_backend
           - os: ubuntu-latest
-            features: alsa_backend,rodio_backend,dbus_keyring,dbus_mpris
+            features: alsa_backend,rodio_backend,dbus_mpris
 
     steps:
       - name: Installing Rust toolchain
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ matrix.rust }}
           override: true
       - name: Installing macOS dependencies
         if: matrix.os == 'macos-latest'
