@@ -4,177 +4,142 @@ use crate::{
     config,
     main_loop::{self, CredentialsProvider},
 };
-#[cfg(feature = "dbus_keyring")]
-use keyring::Keyring;
-use librespot_connect::discovery::discovery;
-use librespot_core::{
-    authentication::Credentials,
-    cache::Cache,
-    config::{ConnectConfig, DeviceType, VolumeCtrl},
-};
+use color_eyre::{eyre::eyre, Section};
+use futures::StreamExt as _;
 use librespot_playback::{
-    audio_backend::{Sink, BACKENDS},
-    config::AudioFormat,
-    mixer::{self, Mixer},
+    audio_backend::{self},
+    mixer::{self, Mixer, MixerConfig},
 };
-use log::info;
-use std::str::FromStr;
+use log::{debug, error, info};
+use std::{sync::Arc, thread, time::Duration};
 
-pub(crate) fn initial_state(config: config::SpotifydConfig) -> main_loop::MainLoop {
-    #[cfg(feature = "alsa_backend")]
-    let mut mixer = {
-        let audio_device = config.audio_device.clone();
-        let control_device = config.control_device.clone();
-        let mixer = config.mixer.clone();
+pub(crate) fn initial_state(
+    config: config::SpotifydConfig,
+) -> color_eyre::Result<main_loop::MainLoop> {
+    let mixer: Arc<dyn Mixer> = {
         match config.volume_controller {
-            config::VolumeController::SoftVolume => {
-                info!("Using software volume controller.");
-                Box::new(|| Box::new(mixer::softmixer::SoftMixer::open(None)) as Box<dyn Mixer>)
-                    as Box<dyn FnMut() -> Box<dyn Mixer>>
+            config::VolumeController::None => {
+                info!("Using no volume controller.");
+                Arc::new(crate::no_mixer::NoMixer)
             }
-            _ => {
+            #[cfg(feature = "alsa_backend")]
+            config::VolumeController::Alsa | config::VolumeController::AlsaLinear => {
+                let audio_device = config.audio_device.clone();
+                let control_device = config.alsa_config.control.clone();
+                let mixer = config.alsa_config.mixer.clone();
                 info!("Using alsa volume controller.");
                 let linear = matches!(
                     config.volume_controller,
                     config::VolumeController::AlsaLinear
                 );
-                Box::new(move || {
-                    Box::new(alsa_mixer::AlsaMixer {
-                        device: control_device
-                            .clone()
-                            .or_else(|| audio_device.clone())
-                            .unwrap_or_else(|| "default".to_string()),
-                        mixer: mixer.clone().unwrap_or_else(|| "Master".to_string()),
-                        linear_scaling: linear,
-                    }) as Box<dyn mixer::Mixer>
-                }) as Box<dyn FnMut() -> Box<dyn Mixer>>
+                Arc::new(alsa_mixer::AlsaMixer {
+                    device: control_device
+                        .clone()
+                        .or_else(|| audio_device.clone())
+                        .unwrap_or_else(|| "default".to_string()),
+                    mixer: mixer.clone().unwrap_or_else(|| "Master".to_string()),
+                    linear_scaling: linear,
+                })
+            }
+            _ => {
+                info!("Using software volume controller.");
+                Arc::new(mixer::softmixer::SoftMixer::open(MixerConfig::default()))
             }
         }
     };
 
-    #[cfg(not(feature = "alsa_backend"))]
-    let mut mixer = {
-        info!("Using software volume controller.");
-        Box::new(|| Box::new(mixer::softmixer::SoftMixer::open(None)) as Box<dyn Mixer>)
-            as Box<dyn FnMut() -> Box<dyn Mixer>>
-    };
-
-    let cache = config.cache;
     let player_config = config.player_config;
     let session_config = config.session_config;
     let backend = config.backend.clone();
-    let autoplay = config.autoplay;
-    let device_id = session_config.device_id.clone();
 
-    #[cfg(feature = "alsa_backend")]
-    let volume_ctrl = if matches!(
-        config.volume_controller,
-        config::VolumeController::AlsaLinear
-    ) {
-        VolumeCtrl::Linear
-    } else {
-        VolumeCtrl::default()
-    };
-
-    #[cfg(not(feature = "alsa_backend"))]
-    let volume_ctrl = VolumeCtrl::default();
+    let has_volume_ctrl = !matches!(config.volume_controller, config::VolumeController::None);
 
     let zeroconf_port = config.zeroconf_port.unwrap_or(0);
 
-    let device_type: DeviceType = DeviceType::from_str(&config.device_type).unwrap_or_default();
+    let creds = if let Some(creds) = config.oauth_cache.as_ref().and_then(|c| c.credentials()) {
+        info!(
+            "Login via OAuth as user {}.",
+            creds.username.as_deref().unwrap_or("unknown")
+        );
+        Some(creds)
+    } else if let Some(creds) = config.cache.as_ref().and_then(|c| c.credentials()) {
+        info!(
+            "Restoring previous login as user {}.",
+            creds.username.as_deref().unwrap_or("unknown")
+        );
+        Some(creds)
+    } else {
+        None
+    };
 
-    let username = config.username;
-    #[allow(unused_mut)] // mut is needed behind the dbus_keyring flag.
-    let mut password = config.password;
-    #[cfg(feature = "dbus_keyring")]
-    {
-        // We only need to check if an actual user has been specified as
-        // spotifyd can run without being signed in too.
-        if username.is_some() && config.use_keyring {
-            info!("Checking keyring for password");
-            let keyring = Keyring::new("spotifyd", username.as_ref().unwrap());
-            let retrieved_password = keyring.get_password();
-            password = password.or_else(|| retrieved_password.ok());
-        }
-    }
-
-    let credentials_provider =
-        if let Some(credentials) = get_credentials(&cache, &username, &password) {
-            CredentialsProvider::SpotifyCredentials(credentials)
-        } else {
-            info!("no usable credentials found, enabling discovery");
-            let discovery_stream = discovery(
-                ConnectConfig {
-                    autoplay,
-                    name: config.device_name.clone(),
-                    device_type,
-                    volume: mixer().volume(),
-                    volume_ctrl: volume_ctrl.clone(),
-                },
-                device_id,
-                zeroconf_port,
+    let discovery = if config.discovery {
+        info!("Starting zeroconf server to advertise on local network.");
+        debug!("Using device id '{}'", session_config.device_id);
+        const RETRY_MAX: u8 = 4;
+        let mut retry_counter = 0;
+        let mut backoff = Duration::from_secs(5);
+        loop {
+            match librespot_discovery::Discovery::builder(
+                session_config.device_id.clone(),
+                session_config.client_id.clone(),
             )
-            .unwrap();
-            discovery_stream.into()
-        };
+            .name(config.device_name.clone())
+            .device_type(config.device_type)
+            .port(zeroconf_port)
+            .launch()
+            {
+                Ok(discovery_stream) => break Some(discovery_stream),
+                Err(err) => {
+                    error!("failed to enable discovery: {err}");
+                    if retry_counter >= RETRY_MAX {
+                        error!("maximum amount of retries exceeded");
+                        break None;
+                    }
+                    info!("retrying discovery in {} seconds", backoff.as_secs());
+                    thread::sleep(backoff);
+                    retry_counter += 1;
+                    backoff *= 2;
+                    info!("trying to enable discovery (retry {retry_counter}/{RETRY_MAX})");
+                }
+            }
+        }
+    } else {
+        None
+    };
 
-    let backend = find_backend(backend.as_ref().map(String::as_ref));
-    main_loop::MainLoop {
+    let credentials_provider = match (discovery, creds) {
+        (Some(stream), creds) => CredentialsProvider::Discovery {
+            stream: stream.peekable(),
+            last_credentials: creds,
+        },
+        (None, Some(creds)) => CredentialsProvider::CredentialsOnly(creds),
+        (None, None) => {
+            return Err(
+                eyre!("Discovery unavailable and no credentials found.").with_suggestion(|| {
+                    "Try enabling discovery or logging in first with `spotifyd authenticate`."
+                }),
+            );
+        }
+    };
+
+    let backend = audio_backend::find(backend).expect("available backends should match ours");
+
+    Ok(main_loop::MainLoop {
         credentials_provider,
-        audio_setup: main_loop::AudioSetup {
-            mixer,
-            backend,
-            audio_device: config.audio_device,
-        },
-        spotifyd_state: main_loop::SpotifydState {
-            cache,
-            device_name: config.device_name,
-            player_event_program: config.onevent,
-        },
-        player_config,
+        mixer,
         session_config,
+        cache: config.cache,
+        audio_device: config.audio_device,
+        audio_format: config.audio_format,
+        player_config,
+        backend,
         initial_volume: config.initial_volume,
-        volume_ctrl,
+        has_volume_ctrl,
         shell: config.shell,
-        device_type,
-        autoplay,
-        use_mpris: config.use_mpris,
-        dbus_type: config.dbus_type,
-    }
-}
-
-fn get_credentials(
-    cache: &Option<Cache>,
-    username: &Option<String>,
-    password: &Option<String>,
-) -> Option<Credentials> {
-    if let Some(credentials) = cache.as_ref().and_then(Cache::credentials) {
-        if username.as_ref() == Some(&credentials.username) {
-            return Some(credentials);
-        }
-    }
-
-    Some(Credentials::with_password(
-        username.as_ref()?,
-        password.as_ref()?,
-    ))
-}
-
-fn find_backend(name: Option<&str>) -> fn(Option<String>, AudioFormat) -> Box<dyn Sink> {
-    match name {
-        Some(name) => {
-            BACKENDS
-                .iter()
-                .find(|backend| name == backend.0)
-                .unwrap_or_else(|| panic!("Unknown backend: {}.", name))
-                .1
-        }
-        None => {
-            let &(name, back) = BACKENDS
-                .first()
-                .expect("No backends were enabled at build time");
-            info!("No backend specified, defaulting to: {}.", name);
-            back
-        }
-    }
+        device_type: config.device_type,
+        device_name: config.device_name,
+        player_event_program: config.onevent,
+        #[cfg(feature = "dbus_mpris")]
+        mpris_config: config.mpris,
+    })
 }
